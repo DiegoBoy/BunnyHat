@@ -12,7 +12,7 @@ My Go at some offensive security tasks (ba-dum-tss):
 - **toorbnny** - an HTTP brute-forcer (similar to [gobuster](https://github.com/OJ/gobuster) dir mode)
 - **mockingbunny** - a fully interactive shell with TCP stream multiplexing
 
-## Why yet another implementation of *X*?
+## Why yet another implementation of *x*?
 
 ### Short answer
 
